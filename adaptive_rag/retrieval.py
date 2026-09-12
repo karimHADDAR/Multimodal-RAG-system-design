@@ -1,12 +1,17 @@
 """Small local retrieval baselines and hybrid evidence fusion."""
 
+from __future__ import annotations
+
 import hashlib
 import math
 import re
 from collections import defaultdict
+from typing import Any, Literal
 
 from .models import EvidenceUnit, RankedEvidence
 from .routing import analyze_query, retrieval_budget
+
+Strategy = Literal["text", "visual", "hybrid", "adaptive"]
 
 
 def _tokens(text: str) -> list[str]:
@@ -26,6 +31,13 @@ def _cosine(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right))
 
 
+def _embedding_similarity(query: Any, candidate: Any) -> float:
+    """Compute similarity for either Torch tensors or lightweight test vectors."""
+    if hasattr(query, "matmul"):
+        return float(query.matmul(candidate))
+    return sum(left * right for left, right in zip(query, candidate))
+
+
 class AdaptiveEvidenceRetriever:
     """Routes questions and fuses text and visual-metadata candidate rankings.
 
@@ -33,17 +45,40 @@ class AdaptiveEvidenceRetriever:
     baseline. Replace `_image_query` with CLIP or SigLIP embeddings for production.
     """
 
-    def __init__(self, evidence: list[EvidenceUnit]) -> None:
+    def __init__(
+        self,
+        evidence: list[EvidenceUnit],
+        image_encoder: Any | None = None,
+        text_encoder: Any | None = None,
+    ) -> None:
         self.evidence = evidence
-        self.text_vectors = {unit.id: _vector(unit.text) for unit in evidence}
+        self.text_encoder = text_encoder
+        self.text_vectors = {
+            unit.id: text_encoder.encode(unit.text) if text_encoder is not None else _vector(unit.text)
+            for unit in evidence
+        }
+        self.image_encoder = image_encoder
+        self.image_vectors = {
+            unit.id: image_encoder.encode_image(unit.image)
+            for unit in evidence if image_encoder is not None and unit.image is not None
+        }
 
     def _search_text(self, question: str, limit: int) -> list[RankedEvidence]:
-        query = _vector(question)
-        ranked = [RankedEvidence(unit, _cosine(query, self.text_vectors[unit.id]), "text")
+        query = self.text_encoder.encode(question) if self.text_encoder is not None else _vector(question)
+        ranked = [RankedEvidence(
+            unit, _embedding_similarity(query, self.text_vectors[unit.id]), "text"
+        )
                   for unit in self.evidence if unit.text]
         return sorted(ranked, key=lambda item: item.score, reverse=True)[:limit]
 
     def _search_visual(self, question: str, limit: int) -> list[RankedEvidence]:
+        if self.image_encoder is not None and self.image_vectors:
+            query = self.image_encoder.encode_text(question)
+            ranked = [RankedEvidence(
+                unit, _embedding_similarity(query, self.image_vectors[unit.id]), "image"
+            ) for unit in self.evidence if unit.id in self.image_vectors]
+            return sorted(ranked, key=lambda item: item.score, reverse=True)[:limit]
+
         query = _vector(question)
         visual = [unit for unit in self.evidence if unit.type != "text" or unit.image_path]
         ranked = [RankedEvidence(unit, _cosine(query, _vector(
@@ -51,9 +86,17 @@ class AdaptiveEvidenceRetriever:
             for unit in visual]
         return sorted(ranked, key=lambda item: item.score, reverse=True)[:limit]
 
-    def retrieve(self, question: str) -> tuple[str, list[RankedEvidence]]:
+    def retrieve(
+        self, question: str, strategy: Strategy = "adaptive"
+    ) -> tuple[str, list[RankedEvidence]]:
+        """Retrieve evidence with a fixed baseline or adaptive routing."""
         route = analyze_query(question)
-        text_limit, visual_limit = retrieval_budget(route)
+        if strategy == "text":
+            return route, self._search_text(question, 5)
+        if strategy == "visual":
+            return route, self._search_visual(question, 5)
+
+        text_limit, visual_limit = (3, 3) if strategy == "hybrid" else retrieval_budget(route)
         text_results = self._search_text(question, text_limit)
         image_results = self._search_visual(question, visual_limit)
         fused: dict[str, float] = defaultdict(float)

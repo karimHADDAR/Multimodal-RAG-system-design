@@ -27,6 +27,7 @@ class EvidenceUnit:
     text: str = ""
     bbox: BoundingBox | None = None
     image_path: str | None = None
+    image: object | None = None
     metadata: dict[str, str] = field(default_factory=dict)
 
 
