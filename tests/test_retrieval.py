@@ -1,9 +1,11 @@
 from adaptive_rag.ingestion import evidence_from_docvqa
-from adaptive_rag.generation import evidence_text
+from adaptive_rag.generation import answer_prompt, evidence_text, top_document_evidence
+from adaptive_rag.models import EvidenceUnit, RankedEvidence
 from adaptive_rag.retrieval import AdaptiveEvidenceRetriever
 from adaptive_rag.routing import analyze_query, retrieval_budget
 from adaptive_rag.sample_data import sample_evidence
 from evaluation.qa_metrics import anls, normalize_answer
+from evaluation.evaluate_retrieval import create_generator, evaluate
 
 
 class FakeImageEncoder:
@@ -77,7 +79,48 @@ def test_evidence_text_preserves_evidence_identifiers() -> None:
     assert "[report-2023:" in evidence_text(results)
 
 
+def test_answer_prompt_requires_an_exact_short_answer() -> None:
+    _, results = AdaptiveEvidenceRetriever(sample_evidence()).retrieve("Aurora revenue")
+    prompt = answer_prompt("What was Aurora revenue?", results)
+    assert "exact shortest answer phrase" in prompt
+    assert "not an explanation" in prompt
+    assert prompt.endswith("Answer:")
+
+
+def test_generation_evidence_is_scoped_to_top_document() -> None:
+    evidence = [
+        RankedEvidence(EvidenceUnit("first:image", "first", 1, "visual_region"), 0.9, "image"),
+        RankedEvidence(EvidenceUnit("second:text", "second", 1, "text", "Wrong document"), 0.8, "text"),
+        RankedEvidence(EvidenceUnit("first:text", "first", 1, "text", "Correct document"), 0.7, "text"),
+    ]
+    scoped = top_document_evidence(evidence)
+    assert [item.evidence.id for item in scoped] == ["first:image", "first:text"]
+
+
 def test_anls_uses_best_accepted_answer_and_threshold() -> None:
     assert normalize_answer("Revenue: $15.8M!") == "revenue 15 8m"
     assert anls("15.8m", ["12.4m", "15.8M"]) == 1.0
     assert anls("unrelated", ["15.8m"]) == 0.0
+
+
+def test_evaluation_logs_each_prediction_record() -> None:
+    records: list[dict[str, object]] = []
+    metrics = evaluate([{
+        "id": "doc-1",
+        "query": {"en": "What is the report?"},
+        "words": ["Annual", "report"],
+        "answers": ["Annual report"],
+    }], prediction_records=records)
+    assert metrics["examples"] == 1
+    assert records[0]["example_id"] == "doc-1"
+    assert records[0]["prediction"] is None
+    assert records[0]["retrieved_document_ids"] == ["doc-1"]
+
+
+def test_generator_factory_rejects_unknown_backend() -> None:
+    try:
+        create_generator("unknown")
+    except ValueError as error:
+        assert "Unsupported answer generator" in str(error)
+    else:
+        raise AssertionError("Expected an unknown generator to be rejected.")

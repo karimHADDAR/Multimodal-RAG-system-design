@@ -9,6 +9,7 @@ import argparse
 import json
 import time
 from collections import Counter
+from pathlib import Path
 
 from datasets import load_dataset
 
@@ -16,7 +17,7 @@ from adaptive_rag.image_encoder import CLIPImageEncoder
 from adaptive_rag.ingestion import evidence_from_docvqa
 from adaptive_rag.retrieval import AdaptiveEvidenceRetriever, Strategy
 from adaptive_rag.text_encoder import SentenceTransformerEncoder
-from adaptive_rag.generation import SmolVLMGenerator
+from adaptive_rag.generation import QwenMLXGenerator, SmolVLMGenerator
 from evaluation.qa_metrics import anls
 
 SPLITS = {
@@ -37,12 +38,22 @@ def document_id(example: dict, index: int) -> str:
     return str(example.get("id", example.get("questionId", example.get("question_id", index))))
 
 
+def create_generator(name: str) -> object:
+    """Create the selected locally runnable vision-language generator."""
+    if name == "smolvlm":
+        return SmolVLMGenerator()
+    if name == "qwen-mlx":
+        return QwenMLXGenerator()
+    raise ValueError(f"Unsupported answer generator: {name}")
+
+
 def evaluate(
     examples: list[dict],
     strategy: Strategy = "adaptive",
     image_encoder: object | None = None,
     text_encoder: object | None = None,
     generator: object | None = None,
+    prediction_records: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Return retrieval metrics over questions whose source document is known."""
     retriever = AdaptiveEvidenceRetriever(
@@ -68,9 +79,26 @@ def evaluate(
             for cutoff in hit_counts:
                 if rank <= cutoff:
                     hit_counts[cutoff] += 1
+        prediction = None
+        answer_score = None
         if generator is not None:
             prediction = generator.answer(question_text(example), results)
-            answer_score_total += anls(prediction, example["answers"])
+            answer_score = anls(prediction, example["answers"])
+            answer_score_total += answer_score
+        if prediction_records is not None:
+            prediction_records.append({
+                "example_id": document_id(example, index),
+                "question": question_text(example),
+                "accepted_answers": example["answers"],
+                "route": route,
+                "target_rank": rank,
+                "retrieved_evidence_ids": [item.evidence.id for item in results],
+                "retrieved_document_ids": list(dict.fromkeys(
+                    item.evidence.document_id for item in results
+                )),
+                "prediction": prediction,
+                "anls": answer_score,
+            })
 
     count = len(examples)
     elapsed_seconds = time.perf_counter() - started_at
@@ -96,6 +124,15 @@ def main() -> None:
     parser.add_argument("--image-encoder", choices=("baseline", "clip"), default="baseline")
     parser.add_argument("--text-encoder", choices=("baseline", "minilm"), default="baseline")
     parser.add_argument("--generate-answers", action="store_true")
+    parser.add_argument(
+        "--generator", choices=("smolvlm", "qwen-mlx"), default="smolvlm",
+        help="Vision-language model used when --generate-answers is enabled.",
+    )
+    parser.add_argument(
+        "--predictions-out",
+        type=Path,
+        help="Write one prediction and evidence record per example as JSON Lines.",
+    )
     arguments = parser.parse_args()
     if arguments.limit < 1:
         parser.error("--limit must be at least 1")
@@ -108,16 +145,25 @@ def main() -> None:
     strategies = ("text", "visual", "hybrid", "adaptive") if arguments.strategy == "all" else (arguments.strategy,)
     image_encoder = CLIPImageEncoder() if arguments.image_encoder == "clip" else None
     text_encoder = SentenceTransformerEncoder() if arguments.text_encoder == "minilm" else None
-    generator = SmolVLMGenerator() if arguments.generate_answers else None
+    generator = create_generator(arguments.generator) if arguments.generate_answers else None
+    prediction_records: list[dict[str, object]] | None = [] if arguments.predictions_out else None
     results = {
-        strategy: evaluate(examples, strategy, image_encoder, text_encoder, generator)
+        strategy: evaluate(
+            examples, strategy, image_encoder, text_encoder, generator, prediction_records
+        )
         for strategy in strategies
     }
+    if arguments.predictions_out:
+        arguments.predictions_out.parent.mkdir(parents=True, exist_ok=True)
+        with arguments.predictions_out.open("w", encoding="utf-8") as output_file:
+            for record in prediction_records or []:
+                output_file.write(json.dumps(record) + "\n")
     print(json.dumps({
         "split": arguments.split,
         "image_encoder": arguments.image_encoder,
         "text_encoder": arguments.text_encoder,
-        "answer_generator": "smolvlm" if arguments.generate_answers else None,
+        "answer_generator": arguments.generator if arguments.generate_answers else None,
+        "predictions_file": str(arguments.predictions_out) if arguments.predictions_out else None,
         "results": results,
     }, indent=2))
 
