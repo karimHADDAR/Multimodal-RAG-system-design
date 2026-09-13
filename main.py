@@ -73,13 +73,58 @@ except Exception as error:
 	st.error(f"DocVQA could not be loaded: {error}")
 	st.stop()
 
-selected_index = st.selectbox(
-	"Choose a benchmark question",
-	range(len(examples)),
-	format_func=lambda index: english_question(examples[index]),
-)
+if "selected_index" not in st.session_state:
+	st.session_state.selected_index = 0
+
+if "question" not in st.session_state:
+	st.session_state.question = english_question(examples[st.session_state.selected_index])
+
+
+def select_question(index: int) -> None:
+	"""Synchronize the editable question with a selected benchmark item."""
+	st.session_state.selected_index = index
+	st.session_state.question_picker = index
+	st.session_state.question = english_question(examples[index])
+
+
+controls_column, navigation_column = st.columns([4, 1])
+with controls_column:
+	selected_index = st.selectbox(
+		"Choose a benchmark question",
+		range(len(examples)),
+		key="question_picker",
+		index=st.session_state.selected_index,
+		format_func=lambda index: f"{index + 1}. {english_question(examples[index])}",
+		on_change=lambda: select_question(st.session_state.question_picker),
+	)
+
+with navigation_column:
+	st.write("Browse")
+	previous, next_question = st.columns(2)
+	with previous:
+		st.button(
+			"Previous",
+			use_container_width=True,
+			disabled=selected_index == 0,
+			on_click=select_question,
+			args=(selected_index - 1,),
+		)
+	with next_question:
+		st.button(
+			"Next",
+			use_container_width=True,
+			disabled=selected_index == len(examples) - 1,
+			on_click=select_question,
+			args=(selected_index + 1,),
+		)
+
 selected = examples[selected_index]
-question = st.text_input("Question", english_question(selected))
+question = st.text_area(
+	"Question",
+	key="question",
+	placeholder="Choose a benchmark question above or enter a question about the selected document.",
+	height=80,
+)
 retriever = AdaptiveEvidenceRetriever(evidence_from_docvqa(examples))
 route, results = retriever.retrieve(question)
 

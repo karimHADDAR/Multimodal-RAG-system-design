@@ -6,6 +6,10 @@ The app loads real document images, questions, ground-truth answers, and OCR
 words. It classifies a question as text, visual, or multimodal, then retrieves
 the documents whose OCR evidence is most relevant.
 
+## Demo
+
+![Adaptive Evidence RAG Streamlit demo](assets/streamlit-demo.png)
+
 ## Start the App
 
 ```bash
